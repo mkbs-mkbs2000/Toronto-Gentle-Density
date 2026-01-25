@@ -1,0 +1,1189 @@
+---
+title: "Technical Appendix - Gentle Density, Rough Reality"
+author: "25188871"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+---
+
+```{r message=FALSE, warning=FALSE}
+# for loading all sorts of data
+library(tidyverse)
+library(sf)
+library(sp)
+library(data.table)
+library(here)
+library(writexl)
+
+# for general data manipulation
+library(janitor)
+
+# to make maps
+library(tmap)
+library(tmaptools)
+library(ggplot2)
+library(ggside)
+library(ggspatial)
+library(prettymapr)
+library(RColorBrewer)
+library(cols4all)
+
+# to do points and cluster analysis
+library(spatstat)
+library(fpc)
+library(dbscan)
+
+# to do spatial autocorrelation analysis
+library(spdep)
+
+# to do regressions
+library(performance)
+library(tidypredict)
+library(spatialreg)
+library(jtools)
+library(lme4)
+library(tidymodels)
+library(car)
+
+# to do PCA/Clustering, and I know the codes in Python not in R
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+py_config()
+```
+
+# Research Qn
+
+1)  Where are ADUs likely to happen in Toronto?
+2)  What are the factors that are associated with the propensity of ADU occurrences in Toronto?
+
+# Output and Plan for Analysis
+
+To answer the first research question, a point cluster analysis of ADU permits (2022-2025) will be conducted using HDBSCAN.
+
+To answer the second research question, an OLS Regression will be conducted. The dependent variable will be set as ADU rates. The independent variables are as follows:\
+- **ACCESSIBILITY**\
+\| Spatial Access Measures, as provided by Statistics Canada (<https://www150.statcan.gc.ca/n1/pub/27-26-0001/272600012023001-eng.htm>)\
+- **BUILDING STOCK CHARACTERISTICS**\
+\| Housing Typologies\
+\| Dwellings' Period of Construction\
+- **NEIGHBOURHOOD DEMOGRAPHICS**\
+\| Young vs Old Dependents\
+\| Visible Minority Rate\
+\| Mover-Migrator Proportions\
+- **HOUSING PRESSURES**\
+\| Census Family Sizes\
+\| Census Family Types\
+\| Owners with Mortgage Rate\
+\| Mortgage Unaffordability Rate (Owner Households who spend \>=30% of Income on Shelter Costs)\
+\| Unsuitable Housing Rate\
+\| 2019 Median After-Tax Income\
+\| GINI Coefficient
+
+With the exception of Spatial Access Measures, all the data is derived from Census 2021 data, which the City of Toronto has aggregated into Toronto Neighbourhood-level detail (<https://open.toronto.ca/dataset/neighbourhood-profiles/>).
+
+# Execution of Analysis
+
+### Getting ADU Permit Data
+
+The City of Toronto releases two datasets on Building Permits - one for active permits (<https://open.toronto.ca/dataset/building-permits-active-permits/>) and another for cleared permits (<https://open.toronto.ca/dataset/building-permits-cleared-permits/>). The datasets are updated daily, and this analysis uses the version as of January 1, 2026.
+
+Both will be filtered for permits issued on or after January 1, 2022. For active permits, the status **'Permit Issued'** and **'Revision Issued'** will be selected. For cleared permits, the status **'Closed'** will be selected. For both datasets, the work **'New Laneway / Rear Yard Suite'** and **'Second Suite (New)'** will be selected. Each permit comes with an Address ID, which is helpful for geocoding because it can be joined with the Toronto Address Point data (<https://open.toronto.ca/dataset/address-points-municipal-toronto-one-address-repository/>).
+
+```{r message=FALSE, warning=FALSE}
+# filtering the cleared permit dataset
+permit_cleaned <- read.csv('ignore/Cleared Building Permits since 2017.csv') %>%
+  clean_names() %>%
+  
+  # setting the necessary columns as numeric
+  mutate(
+    issued_date = as.Date(issued_date, format = "%Y-%m-%d"),
+    issued_year = as.integer(format(issued_date, "%Y")) 
+    ) %>%
+  
+  # filtering for ADU permits, which permits were issued on or after January 1, 2022 and the final status is Closed (indicating completion)
+  filter(work %in% c("New Laneway / Rear Yard Suite", "Second Suite (New)"),
+         issued_date > as.Date("2021-12-31"),
+         status == 'Closed') %>%
+  
+  # since some permits have revisions, they are separately recorded in the dataset. This is why it is necessary to group_by and summarise
+  group_by(permit_num) %>%
+  
+  # ensuring that each permit has the geo_id and year of issue
+  summarise(
+    geo_id = first(geo_id),
+    issued_year = first(issued_year)
+    )
+
+# ------------------------------------------------------------------------------
+# now filtering the active permit dataset
+permit_active <- read.csv('ignore/building-permits-active-permits.csv') %>%
+  clean_names() %>%
+  
+  # setting the necessary columns as numeric
+  mutate(
+    issued_date = as.Date(issued_date, format = "%Y-%m-%d"),
+    issued_year = as.integer(format(issued_date, "%Y"))
+    ) %>%
+  
+  # filtering for ADU permits, which permits were issued on or after January 1, 2022 and the final status is either Permit Issued or Revision Issued
+  filter(work %in% c("New Laneway / Rear Yard Suite", "Second Suite (New)"),
+         issued_date > as.Date("2021-12-31"),
+         status %in% c('Permit Issued', 'Revision Issued')) %>% 
+  
+  # since some permits have revisions, they are separately recorded in the dataset. This is why it is necessary to group_by and summarise
+  group_by(permit_num) %>%
+  
+  # ensuring that each permit has the geo_id and year of issue
+  summarise(
+    geo_id = first(geo_id),
+    issued_year = first(issued_year)
+    )
+
+# ------------------------------------------------------------------------------
+# Now combining both filtered datasets together
+permit_total <- bind_rows(permit_cleaned, permit_active) %>%
+  
+  # redoing group_by and summarise in order to prevent potential double counting across the two datasets
+  group_by(permit_num) %>%
+  
+  # ensuring that each permit has the geo_id and year of issue
+  summarise(
+    geo_id = first(geo_id),
+    issued_year = first(issued_year)
+    )
+
+# ------------------------------------------------------------------------------
+# joining Address Point Data with the filtered ADU permits data
+adu_permits <- permit_total %>%
+  left_join(., 
+            st_read('ignore/Address Points - 4326.shp') %>%
+              clean_names() %>%
+              dplyr::select(address2, geometry),
+            by = c('geo_id' = 'address2')) %>%
+  st_as_sf(.,
+           sf_column_name = 'geometry',
+           crs = 4326) %>%
+  filter(!st_is_empty(geometry)) %>%
+  
+  mutate(issued_year = factor(issued_year, levels = c(2022, 2023, 2024, 2025)))
+
+st_write(adu_permits, 'adu_permits_2022_2025.geojson', driver = 'GeoJSON', append = FALSE)
+
+# ------------------------------------------------------------------------------
+# showing histogram of filtered ADU permits data by year
+adu_year_counts <- adu_permits %>%
+  count(issued_year, name = "n_permits")
+
+p <- ggplot(adu_year_counts, aes(x = factor(issued_year), y = n_permits)) +
+  geom_col(alpha = 0.8, fill = "blue") +
+  geom_text(aes(label = n_permits), vjust = -0.3, size = 3) +
+  labs(title = "Total ADU Permits issued by Year",
+       x = "Year",
+       y = "No. of Permits") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p
+
+ggsave("adu_permits_by_year.png", plot = p, width = 8, height = 5, dpi = 300)
+
+write.csv(st_drop_geometry(adu_year_counts), "adu_year_counts.csv", row.names = FALSE)
+```
+
+Also loading the shapefile of Toronto Neighbourhoods (<https://open.toronto.ca/dataset/neighbourhoods/>) to facilitate analysis later.
+
+```{r message=FALSE, warning=FALSE}
+toronto_neigh <- st_read('Neighbourhoods - 4326.geojson') %>%
+  st_transform(., 4326) %>%
+  dplyr::select(AREA_SHORT_CODE, geometry)
+```
+
+### Creating a DB-Toronto Neighbourhood Relationship
+
+Data on Spatial Access Measures given by Statistics Canada is given at Dissemination Block level. Toronto Neighbourhoods however is a custom geographical unit created by City of Toronto that is based on Statistics Canada's Census Tract.
+
+In theory, we need a relationship file that maps out each DB to Census Tract (which exists, link) and then to Neighbourhood (this is the one that is missing). Thus a messy workaround. as seen below, needs to be conducted beforehand to establish this relationship. At the end, we need to have an object called **toronto_dgrf** that maps out how all 13,323 DBs in the City of Toronto maps out to the Neighbourhood.
+
+```{r message=FALSE, warning=FALSE}
+# loading the full relationship file
+toronto_rs <- read.csv('ignore/2021_98260004.csv') %>%
+  
+  # selecting the column with IDs of Dissemination Blocks (DB) and their linked Census Tract (CT) IDs, and then renaming them 
+  dplyr::select(CTDGUID_SRIDUGD, DBDGUID_IDIDUGD) %>%
+  rename(CTUID = CTDGUID_SRIDUGD, DBUID = DBDGUID_IDIDUGD) %>%
+  
+  # Dissemination Blocks have a standard number formatting, which are as follows
+  # 2021 refers to the Census Year that the ID is created
+  # S refers to the fact that this is a statistical geographical unit
+  # 0513 is the code to identify that this is an ID for a Dissemination Block
+  # 35 is the province ID for Ontario, where the City of Toronto is
+  # 20 is the Census Subdivision ID for the City of Toronto
+  filter(str_detect(`DBUID`, '^2021S05133520')) %>%
+  
+  # the remaining IDs need to be cleaned to remove the earlier initials because they are not relevant in the analysis down the road
+  mutate(DBUID = str_remove(DBUID, "2021S0513"),
+         CTUID = str_remove(CTUID, "2021S0507"))
+
+# ------------------------------------------------------------------------------
+# we first load the Census Tract file for all of Canada
+ct_to_neigh <- st_transform(st_read('lct_000b21a_e.shp', quiet = TRUE), 26917) %>%
+  dplyr::select(CTUID, geometry) %>%
+  
+  # filter this for CTs in Toronto, based on Toronto DB-CT relationship generated earlier
+  filter(CTUID %in% unique(toronto_rs$CTUID)) %>%
+  
+  # this is then intersected with the Toronto Neighbourhoods shapefile
+  st_intersection(., st_transform(toronto_neigh, 26917)) %>%
+  
+  # calculate the area of each geometry
+  mutate(area = st_area(geometry)) %>%
+  
+  # since the CT shapefile and Toronto Neighbourhood shapefile are not produced by the same author, the intersection produces slivers of some CTs that are split into different Neighbourhoods --> the solution I adopted is to group the outcomes by the same CT ID and take the one with the biggest area (because the duplicate smaller areas are due to the slightly imprecise boundaries between the two shapefiles)
+  group_by(CTUID) %>%
+  slice_max(order_by = area, n = 1, with_ties = FALSE) %>%
+  
+  # removing geometry because all I need is the relationship between CT and Neighbourhoods
+  ungroup() %>%
+  st_drop_geometry() %>%
+  dplyr::select(AREA_SHORT_CODE, CTUID)
+
+# ------------------------------------------------------------------------------
+# now all is needed to join the CT-Neighbourhood relationship to the DB-CT relationship!
+toronto_dgrf <- toronto_rs %>%
+  left_join(., ct_to_neigh,
+            by = 'CTUID')
+```
+
+### Getting Spatial Access Measures Data
+
+On top of the fact that Spatial Access Measures data is given at the DB level, it is also provided for VARIOUS modes of transportation to VARIOUS types of destination. The personal decision is made to only bring in the data for Cycling (All Ages and Abilities, to represent the lowest common denominator for cycling), Public Transport (Peak and Off-Peak separately) and Walking, but each mode consists of the mean access score to those various destinations.
+
+While we have the full DB-Neighbourhood relationships, another personal decision has been made to aggregate the data through a simple median to reduce the impact of one highly accessible DB on the whole neighbourhood.
+
+```{r message=FALSE, warning=FALSE}
+# setting up a list of the destinations used across the different transport mode datasets
+# HF refers to healthcare facilities
+# EMP refers to employment opportunities
+# SRF refers to sports and recreational facilities
+# PSEF refers to post-secondary educational facilities
+# EF refers to K-12 educational facilities
+# CAF refers to culture and arts facilities
+# CCF refers to child care facilities 
+acc_cols_no_gcs = c('acs_idx_hf', 
+                    'acs_idx_emp', 
+                    'acs_idx_srf',
+                    'acs_idx_psef',
+                    'acs_idx_ef',
+                    'acs_idx_caf',
+                    'acs_idx_ccf')
+
+# ------------------------------------------------------------------------------
+# loading Cycling (All Ages and Abilities) SAM dataset first
+cycling <- read.csv('acs_cycling_all_ages_and_abilities.csv', na = '..') %>%
+  
+  # filtering for Toronto DBs
+  filter(str_detect(`DBUID`, '^3520')) %>%
+  mutate(DBUID = as.character(DBUID),
+         
+         # calculating the mean access score to the seven destination types
+         mean_acc_no_gcs = rowMeans(
+           dplyr::select(., acc_cols_no_gcs),
+           na.rm = TRUE
+         )) %>%
+  
+  # the DB-Neighbourhood relationship is then joined to the mean DB cycling access data
+  left_join(., toronto_dgrf, by = 'DBUID') %>%
+  
+  # group_by unique Toronto Neighbourhoods, and calculating median cycling access data for each neighbourhood
+  group_by(AREA_SHORT_CODE) %>%
+  summarise(median_cycling = median(mean_acc_no_gcs, na.rm = TRUE))
+
+# ------------------------------------------------------------------------------
+# Repeating the steps above but for Public Transport (Peak)
+pt_peak <- read.csv('acs_public_transit_peak.csv', na = '..') %>%
+  filter(str_detect(`DBUID`, '^3520')) %>%
+  mutate(DBUID = as.character(DBUID),
+         mean_acc_no_gcs = rowMeans(
+           dplyr::select(., acc_cols_no_gcs),
+           na.rm = TRUE
+         )) %>%
+  left_join(., toronto_dgrf, by = 'DBUID') %>%
+  group_by(AREA_SHORT_CODE) %>%
+  summarise(median_pt_peak = median(mean_acc_no_gcs, na.rm = TRUE))
+
+# ------------------------------------------------------------------------------
+# Repeating the steps above but for Public Transport (Off-Peak)
+pt_offpeak <- read.csv('acs_public_transit_offpeak.csv', na = '..') %>%
+  filter(str_detect(`DBUID`, '^3520')) %>%
+  mutate(DBUID = as.character(DBUID),
+         mean_acc_no_gcs = rowMeans(
+           dplyr::select(., acc_cols_no_gcs),
+           na.rm = TRUE
+         )) %>%
+  left_join(., toronto_dgrf, by = 'DBUID') %>%
+  group_by(AREA_SHORT_CODE) %>%
+  summarise(median_pt_offpeak = median(mean_acc_no_gcs, na.rm = TRUE))
+
+# ------------------------------------------------------------------------------
+# Repeating the steps above but for Walking
+walking <- read.csv('acs_walking.csv', na = '..') %>%
+  filter(str_detect(`DBUID`, '^3520')) %>%
+  mutate(DBUID = as.character(DBUID),
+         mean_acc_no_gcs = rowMeans(
+           dplyr::select(., acc_cols_no_gcs),
+           na.rm = TRUE
+         )) %>%
+  left_join(., toronto_dgrf, by = 'DBUID') %>%
+  group_by(AREA_SHORT_CODE) %>%
+  summarise(median_walking = median(mean_acc_no_gcs, na.rm = TRUE))
+```
+
+### Getting Census Data
+
+Census 2021 Data has been helpfully aggregated into Toronto Neighbourhood-level detail by the City of Toronto, sparing us of the nightmare of aggregating. Thus the challenge of this data cleaning section is to identify the relevant sets of data, and, where applicable, converting the counts data into percentage data.
+
+```{r message=FALSE, warning=FALSE}
+# identifying relevant information needed from the Census 2021 data 
+relevant_col_id = c(1,
+                    30, 32, # broad age distribution percentages
+                    144, 214,  # median after tax 2019, GINI after tax
+                    216, # occupied private dwelling TOTAL, to be used as denominator
+                    217, 218, 219, 220,  # housing types
+                    324, # unsuitable housing count
+                    326, 327, 328, 329, 330, 331, 332, 333,  # period of const
+                    368, 369, # mortgage unaffordability share
+                    385, # census families TOTAL, to be used as denominator
+                    386, 387, 388, # census family sizes
+                    394, 397, 400, 401, # census family types
+                    1641, 1642, # visible minority
+                    1941, 1942, 1944, 1947, 1948, 1949) # migrator types
+
+# ------------------------------------------------------------------------------
+# Loading Census 2021 data, filtering for the relevant information, and transposing it
+census_2021 <- fread('neighbourhood-profiles-2021-158-model.csv') %>%
+  mutate(row_id = row_number()) %>%
+  filter(row_id %in% relevant_col_id)
+
+census_transposed <- census_2021 %>%
+  dplyr::select(-row_id) %>%
+  mutate(across(1, make.unique)) %>% 
+  column_to_rownames(var = names(.)[1]) %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("AREA_NAME") %>%
+  filter(AREA_NAME != 'row_id') %>%
+  clean_names()
+
+# ------------------------------------------------------------------------------
+# Creating the Rates from the Count Data in the Census
+census_cleaned <- census_transposed %>%
+  
+  mutate(
+    # reformatting neighbourhood number to have three characters (001 to 174)
+    neighbourhood_number = as.character(sprintf("%03d", as.integer(census_transposed$neighbourhood_number))),
+    
+    # initial reformatting of every other cols except area name and area code as numeric, to facilitate rates calculation
+    across(3:ncol(.), ~ as.numeric(.)),
+    
+    # calculating housing type shares for each neighbourhood
+    single_det_rate = single_detached_house / total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data,
+    semi_det_rate = semi_detached_house / total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data,
+    row_hse_rate = row_house / total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data,
+    duplex_rate = apartment_or_flat_in_a_duplex / total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data,
+    eligible_type_count = single_detached_house + semi_detached_house + row_house + apartment_or_flat_in_a_duplex,
+    
+    # calculating housing unsuitability rate for each neighbourhood
+    unsuitability_rate = (not_suitable / total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data)*100,
+    
+    # calculating construction period shares for each neighbourhood
+    bef60_hse_rate = x1960_or_before/total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data,
+    x60s70s_hse_rate = x1961_to_1980/total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data,
+    x80s_hse_rate = x1981_to_1990/total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data,
+    x90s_hse_rate = x1991_to_2000/total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data,
+    x00s_hse_rate = (x2001_to_2005 + x2006_to_2010)/total_occupied_private_dwellings_by_structural_type_of_dwelling_25_percent_sample_data,
+    
+    # calculating rates of census family sizes for each neighbourhood
+    x2p_rate = x2_persons / total_census_families_in_private_households_by_family_size_25_percent_sample_data,
+    x3p_rate = x3_persons / total_census_families_in_private_households_by_family_size_25_percent_sample_data,
+    x4p_rate = x4_persons / total_census_families_in_private_households_by_family_size_25_percent_sample_data,
+
+    # calculating rates of census family types for each neighbourhood
+    couples_wchildren = ((with_children + with_children_1) / total_census_families_in_private_households_by_family_size_25_percent_sample_data)*100,
+    single_parent = ((in_which_the_parent_is_a_woman + in_which_the_parent_is_a_man) / total_census_families_in_private_households_by_family_size_25_percent_sample_data)*100,
+    
+    # calculating visible minority rates for each neighbourhood
+    vis_min_rate = (total_visible_minority_population / total_visible_minority_for_the_population_in_private_households_25_percent_sample_data)*100,
+    
+    # calculating mover (moving in from within the city) and migrant (moving in from outside the city) rates for each neighbourhood
+    domestic_movers = ((non_migrants + intraprovincial_migrants + interprovincial_migrants) / total_mobility_status_5_years_ago_25_percent_sample_data)*100,
+    foreign_movers = (external_migrants / total_mobility_status_5_years_ago_25_percent_sample_data)*100
+    ) %>%
+  
+  rename(AREA_SHORT_CODE = neighbourhood_number,
+         young_dep = x0_to_14_years,
+         old_dep = x65_years_and_over,
+         median_aftertax_income = median_after_tax_income_in_2019_among_recipients,
+         gini_index = gini_index_on_adjusted_household_after_tax_income,
+         with_mortgage = percent_of_owner_households_with_a_mortgage,
+         mortgage_unaffordable = percent_of_owner_households_spending_30_percent_or_more_of_its_income_on_shelter_costs) %>%
+  
+  dplyr::select(AREA_SHORT_CODE, area_name, young_dep, old_dep, median_aftertax_income, gini_index, single_det_rate, semi_det_rate, row_hse_rate, duplex_rate, eligible_type_count, unsuitability_rate, bef60_hse_rate, x60s70s_hse_rate, x80s_hse_rate, x90s_hse_rate, x00s_hse_rate, with_mortgage, mortgage_unaffordable, x2p_rate, x3p_rate, x4p_rate, couples_wchildren, single_parent, vis_min_rate, domestic_movers, foreign_movers)
+```
+
+### Pooling All Neighbourhood-Level Statistics Together
+
+```{r message=FALSE, warning=FALSE}
+toronto_combined <- toronto_neigh %>%
+  left_join(., census_cleaned, by = 'AREA_SHORT_CODE') %>%
+  left_join(., cycling, by = 'AREA_SHORT_CODE') %>%
+  left_join(., pt_offpeak, by = 'AREA_SHORT_CODE') %>%
+  left_join(., pt_peak, by = 'AREA_SHORT_CODE') %>%
+  left_join(., walking, by = 'AREA_SHORT_CODE') %>%
+  mutate(
+    adu_count = lengths(st_intersects(., adu_permits)),
+    adu_rate = (adu_count / eligible_type_count)*100
+    )
+```
+
+### Doing Point Cluster Analysis
+
+**Step 1: Proving that there is clustering going on in the first place using Ripley's K**
+
+```{r message=FALSE, warning=FALSE}
+adu_proj <- adu_permits %>%
+  st_transform(26917)
+
+adu_sp <- adu_proj %>%
+  st_cast('POINT') %>%
+  as('Spatial')
+
+toronto_proj <- toronto_neigh %>%
+  st_transform(26917) %>%
+  st_union()
+
+ppp_obj <- ppp(x = adu_sp@coords[,1],
+               y = adu_sp@coords[,2],
+               window = as.owin(toronto_proj))
+
+K_result <- Kest(ppp_obj, correction = "border") %>%
+  plot()
+```
+
+The fact that Kbord is above Kpois up until r = 2000 provides proof that there is some kind of clustering going on within ADU permit activity up until a distance of 2km.
+
+**Step 2: Showing where the point clustering is happening using HDBSCAN**
+
+The Minimum Points is set to 1% of total ADU permits, which **would be about 19**.
+
+```{r message=FALSE, warning=FALSE}
+coord_df <- adu_sp %>%
+  coordinates() %>%
+  as.data.frame()
+
+hdbscan <- hdbscan(coord_df, minPts = 19)
+
+hdb_results <- coord_df %>%
+  mutate(Clusters = hdbscan$cluster) %>%
+  filter(Clusters != 0) %>%
+  mutate(Clusters = factor(Clusters)) %>%
+  st_as_sf(.,
+           coords = c('coords.x1', 'coords.x2'), 
+           crs = 26917)
+
+# make the hull polygons for each cluster, thus making a layer of multipolygon spatial dataframe
+cluster_polygons <- hdb_results %>%
+  group_by(Clusters) %>%
+  summarise(geometry = st_combine(geometry),
+            count = n()) %>%
+  mutate(geometry = st_convex_hull(geometry)) %>%
+  st_as_sf()
+
+cluster_cols <- setNames(
+  colorRampPalette(brewer.pal(9, "Set1"))(nlevels(hdb_results$Clusters)),
+  levels(hdb_results$Clusters)
+  )
+
+# put the layers together
+cluster_map <- ggplot() +
+  
+  #base maps and layers
+  annotation_map_tile(zoom = 12) +
+  geom_sf(data = toronto_proj, alpha = 0, lwd = 0.5) +
+  geom_sf(data = adu_proj, aes(shape = 'ADU Permits'), color = 'black', alpha = 0.8, size = 0.8) +
+
+  #then put the cluster points
+  geom_sf(data = hdb_results, aes(color = Clusters), size = 0.8, show.legend = FALSE) +
+  
+  #then put the cluster hull polygons
+  geom_sf(data = cluster_polygons, aes(fill = Clusters), alpha = 0.6, color = NA) +
+  
+  # manually adjusting aesthetics and legends for the map
+  scale_fill_manual(values = cluster_cols, name = 'Clusters') +
+  scale_color_manual(values = cluster_cols, guide = 'none') +
+  scale_shape_manual(values = c('ADU Permits' = 16), name = NULL) +
+  
+  labs(title = 'Clustering of 2022-2025 ADU Permits in Toronto') +
+  
+  theme_void() +
+  
+  theme(
+    plot.title.position = 'plot',
+    plot.title = element_text(hjust = 0.5, margin = margin(b = 10))
+    ) +
+  
+  guides(
+    shape = guide_legend(order = 1, override.aes = list(size = 3, alpha = 1)),
+    fill = guide_legend(order = 2)
+  )
+
+cluster_map
+
+ggsave("clustering.png", plot = cluster_map, width = 8, height = 5, dpi = 300)
+
+st_write(st_transform(hdb_results, 4326), 'hdb_results.geojson', driver = 'GeoJSON', append = FALSE)
+
+st_write(st_transform(cluster_polygons, 4326), 'cluster_polygons.geojson', driver = 'GeoJSON', append = FALSE)
+
+# showing a table of ADU counts in each cluster
+cluster_polygons
+```
+
+The HDBSCAN identifies seven clusters all across Toronto, ranging from as little as 25 permits to as many as 643 permits. The notable clusters are the second-largest (which is also the densest) cluster, with 562 permits, that is located west of Downtown Toronto, stretching into High Park and Lawrence Avenue, as well as the largest cluster in size and number, with 643 permits, stretching from the Don River to Scarborough.
+
+Now that we know where ADUs are clustering, let's see if they could be correlated with neighbourhood built or socio-demographic characteristics via regression analysis.
+
+### Conducting Principal Components Analysis
+
+The toronto_combined object has 34 independent variables. This is NOT suitable for regression and therefore requires dimensionality reduction. Groups of relevant and related data needs to be isolated and PCA conducted on each group separately.
+
+```{r}
+accessibility <- toronto_combined %>%
+  dplyr::select(AREA_SHORT_CODE, median_cycling, median_pt_offpeak, median_pt_peak, median_walking) %>%
+  st_drop_geometry()
+
+housing_type <- toronto_combined %>%
+  dplyr::select(AREA_SHORT_CODE, single_det_rate, semi_det_rate, row_hse_rate, duplex_rate) %>%
+  st_drop_geometry()
+
+const <- toronto_combined %>%
+  dplyr::select(AREA_SHORT_CODE, bef60_hse_rate, x60s70s_hse_rate, x80s_hse_rate, x90s_hse_rate, x00s_hse_rate) %>%
+  st_drop_geometry()
+
+family_size <- toronto_combined %>%
+  dplyr::select(AREA_SHORT_CODE, x2p_rate, x3p_rate, x4p_rate) %>%
+  st_drop_geometry()
+```
+
+The PCAs will be done using Python code
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+sns.set(style="whitegrid", context="notebook")
+plt.rcParams["figure.figsize"] = (8, 6)
+```
+
+Each PCA process will go through a standardisation BEFORE (so as to ensure that contributing factors with exceedingly high raw values do not disproportionately affect the PCs) and AFTER (to facilitate comparison with other PCs produced from other PCAs during regression analysis)
+
+**PCA for Accessibility**
+
+```{python}
+access = r.accessibility
+access = access.set_index('AREA_SHORT_CODE')
+
+scaled = StandardScaler().fit_transform(access)
+
+# Fit and transform, then wrap back to DataFrame
+access_scaled = pd.DataFrame(
+    scaled,
+    columns=access.columns,   # preserve column names
+    index=access.index        # preserve row labels
+)
+
+pca = PCA()
+
+# fit the components
+pca_accessibility = pca.fit_transform(access_scaled)
+
+# Explained variance ratio -----------------------------------------------------
+explained_var = pca.explained_variance_ratio_
+num_components = len(explained_var)
+
+# print explained_var and accumulative explained variance
+df_explained_var = pd.DataFrame({
+    "n_pc": np.arange(1, len(explained_var) + 1),
+    "explained_var": explained_var,
+    "cum_var": np.cumsum(explained_var)
+})
+
+print("Table of explained variance:\n", df_explained_var.round(3))
+
+# the sum of explained variance should be equal to 1.0 or 100%
+print('Sum of explained variance ratio of all PCs：{}'.format(pca.explained_variance_ratio_.sum()), '\n') 
+
+# Elbow detection using "turning point" (discrete second derivative) -----------
+y = explained_var
+
+# Need at least 3 points to compute a second derivative
+if num_components < 3:
+    # Fallback: choose 1 component if fewer than 3 PCs
+    k = 1
+else:
+    # First differences: dy[i] = y[i+1] - y[i]
+    dy = np.diff(y)                  # length: num_components - 1
+
+    # Second differences: ddy[i] = dy[i+1] - dy[i]
+    ddy = np.diff(dy)                # length: num_components - 2
+
+    # Index of max absolute curvature (turning point)
+    # ddy[i] is curvature at original index i+1 (0-based)
+    turning_idx = np.argmax(np.abs(ddy))  # in range [0, num_components-3]
+
+    # Convert to PC index (1-based for plotting/human interpretation)
+    k = turning_idx + 2  # +1 for 0-based -> original index, +1 more because curvature is at i+1
+
+print(f"Chosen k based on turning-point elbow detection: {k} \n")
+
+# Show the loading table -------------------------------------------------------
+df_PC = pd.DataFrame(pca.components_, columns = access_scaled.columns.to_list()) # the list_var_X is used as the column names
+print('Factor Loading Table : \n', df_PC)
+```
+
+The turning elbow detection and explained variance suggests to choose the first two PCs because cumulatively it could explain 96% of variance across all accessibility metrics.
+
+However, when compared with the loading table, the first PC has positive loading for every metric, which can be seen as an **general non-auto accessibility metric**. It also can explain 88% of the variance.
+
+For ease of analysis, only the first PC will be selected and standardised for regression.
+
+```{python}
+selected_PC = 1
+pca = PCA(selected_PC, random_state=0)
+scores = pca.fit_transform(access_scaled)
+
+# Put scores in a DF with the SAME index (row_id)
+pc_cols = [f"access_PC{i+1}" for i in range(selected_PC)]
+df_access_pcs = pd.DataFrame(scores, index=access.index, columns=pc_cols)
+
+# Standardise PC scores (so each has mean 0, SD 1)
+scaler_pc = StandardScaler()
+df_access_pcs_z = pd.DataFrame(
+    scaler_pc.fit_transform(df_access_pcs),
+    index=df_access_pcs.index,
+    columns=[c + "_z" for c in df_access_pcs.columns]
+)
+
+# convert index back into a column
+access_pcs = df_access_pcs_z.reset_index()
+```
+
+**PCA for Housing Type Mix**
+
+```{python}
+housing_type = r.housing_type
+housing_type = housing_type.set_index('AREA_SHORT_CODE')
+
+scaled = StandardScaler().fit_transform(housing_type)
+
+# Fit and transform, then wrap back to DataFrame
+housing_scaled = pd.DataFrame(
+    scaled,
+    columns=housing_type.columns,   # preserve column names
+    index=housing_type.index        # preserve row labels
+)
+
+pca = PCA()
+
+# fit the components
+pca_housing = pca.fit_transform(housing_scaled)
+
+# Explained variance ratio -----------------------------------------------------
+explained_var = pca.explained_variance_ratio_
+num_components = len(explained_var)
+
+# print explained_var and accumulative explained variance
+df_explained_var = pd.DataFrame({
+    "n_pc": np.arange(1, len(explained_var) + 1),
+    "explained_var": explained_var,
+    "cum_var": np.cumsum(explained_var)
+})
+
+print("Table of explained variance \n", df_explained_var.round(3))
+
+# the sum of explained variance should be equal to 1.0 or 100%
+print('Sum of explained variance ratio of all PCs：{}'.format(pca.explained_variance_ratio_.sum()), '\n')
+
+# Elbow detection using "turning point" (discrete second derivative) -----------
+y = explained_var
+
+# Need at least 3 points to compute a second derivative
+if num_components < 3:
+    # Fallback: choose 1 component if fewer than 3 PCs
+    k = 1
+else:
+    # First differences: dy[i] = y[i+1] - y[i]
+    dy = np.diff(y)                  # length: num_components - 1
+
+    # Second differences: ddy[i] = dy[i+1] - dy[i]
+    ddy = np.diff(dy)                # length: num_components - 2
+
+    # Index of max absolute curvature (turning point)
+    # ddy[i] is curvature at original index i+1 (0-based)
+    turning_idx = np.argmax(np.abs(ddy))  # in range [0, num_components-3]
+
+    # Convert to PC index (1-based for plotting/human interpretation)
+    k = turning_idx + 2  # +1 for 0-based -> original index, +1 more because curvature is at i+1
+
+print(f"Chosen k based on turning-point elbow detection: {k} \n")
+
+# Show the loading table -------------------------------------------------------
+df_PC = pd.DataFrame(pca.components_, columns = housing_scaled.columns.to_list()) # the list_var_X is used as the column names
+print('Factor Loading Table : \n', df_PC)
+```
+
+The turning elbow detection and explained variance suggests to choose the first three PCs because they cumulatively explain up to 86% of the variance across housing type metrics.
+
+The first PC has strong positive loading for **single-detached and duplex houses**
+
+The second PC has strong positive loading for semi-detached and row houses while having strong negative loadings for single-detached houses. This suggests a spectrum of **semi-detached, row VS single-detached**.
+
+Third PC has strong positive loading for row houses and strong negative loading for semi-detached houses. This suggests a spectrum of **row houses VS semi-detached**.
+
+```{python}
+selected_PC = 3
+pca = PCA(selected_PC, random_state=0)
+scores = pca.fit_transform(housing_scaled)
+
+# Put scores in a DF with the SAME index (row_id)
+pc_cols = [f"housing_PC{i+1}" for i in range(selected_PC)]
+df_housing_pcs = pd.DataFrame(scores, index=housing_type.index, columns=pc_cols)
+
+# Standardise PC scores (so each has mean 0, SD 1)
+scaler_pc = StandardScaler()
+df_housing_pcs_z = pd.DataFrame(
+    scaler_pc.fit_transform(df_housing_pcs),
+    index=df_housing_pcs.index,
+    columns=[c + "_z" for c in df_housing_pcs.columns]
+)
+
+# convert index back into a column
+housing_pcs = df_housing_pcs_z.reset_index()
+```
+
+**PCA for Construction Period**
+
+```{python}
+const = r.const
+const = const.set_index('AREA_SHORT_CODE')
+
+scaled = StandardScaler().fit_transform(const)
+
+# Fit and transform, then wrap back to DataFrame
+const_scaled = pd.DataFrame(
+    scaled,
+    columns=const.columns,   # preserve column names
+    index=const.index        # preserve row labels
+)
+
+pca = PCA()
+
+# fit the components
+pca_const = pca.fit_transform(const_scaled)
+
+# Explained variance ratio -----------------------------------------------------
+explained_var = pca.explained_variance_ratio_
+num_components = len(explained_var)
+
+# print explained_var and accumulative explained variance
+df_explained_var = pd.DataFrame({
+    "n_pc": np.arange(1, len(explained_var) + 1),
+    "explained_var": explained_var,
+    "cum_var": np.cumsum(explained_var)
+})
+
+print("Table of explained variance \n", df_explained_var.round(3))
+
+# the sum of explained variance should be equal to 1.0 or 100%
+print('Sum of explained variance ratio of all PCs：{}'.format(pca.explained_variance_ratio_.sum()), '\n')
+
+# Elbow detection using "turning point" (discrete second derivative) -----------
+y = explained_var
+
+# Need at least 3 points to compute a second derivative
+if num_components < 3:
+    # Fallback: choose 1 component if fewer than 3 PCs
+    k = 1
+else:
+    # First differences: dy[i] = y[i+1] - y[i]
+    dy = np.diff(y)                  # length: num_components - 1
+
+    # Second differences: ddy[i] = dy[i+1] - dy[i]
+    ddy = np.diff(dy)                # length: num_components - 2
+
+    # Index of max absolute curvature (turning point)
+    # ddy[i] is curvature at original index i+1 (0-based)
+    turning_idx = np.argmax(np.abs(ddy))  # in range [0, num_components-3]
+
+    # Convert to PC index (1-based for plotting/human interpretation)
+    k = turning_idx + 2  # +1 for 0-based -> original index, +1 more because curvature is at i+1
+
+print(f"Chosen k based on turning-point elbow detection: {k} \n")
+
+# Show the loading table -------------------------------------------------------
+df_PC = pd.DataFrame(pca.components_, columns = const_scaled.columns.to_list()) # the list_var_X is used as the column names
+print('Factor Loading Table : \n', df_PC)
+```
+
+The turning elbow detection and explained variance suggests to choose the first three PCs. However, the difference in explained variance between the second and third PCs is almost 15%. The third PC also has mixed loading across the time periods that complicates interpretation (+ve loadings for before 60s, 80s-90s and -ve loadings for 60s-70s, 00s). I am therefore inclined to select up to **two PCs**.
+
+The first PC has positive loading for houses built before the 60s (0.58) and negative loading for every other factor. This suggest an **before-60s dominant housing stock**.
+
+The second PC has positive loading for houses built in the 60s-70s (0.71) and 80s (0.26), while other factors have negative loadings. This suggests a **60s-80s dominant housing stock**.
+
+```{python}
+selected_PC = 2
+pca = PCA(selected_PC, random_state=0)
+scores = pca.fit_transform(const_scaled)
+
+# Put scores in a DF with the SAME index (row_id)
+pc_cols = [f"const_PC{i+1}" for i in range(selected_PC)]
+df_const_pcs = pd.DataFrame(scores, index=const.index, columns=pc_cols)
+
+# Standardise PC scores (so each has mean 0, SD 1)
+scaler_pc = StandardScaler()
+df_const_pcs_z = pd.DataFrame(
+    scaler_pc.fit_transform(df_const_pcs),
+    index=df_const_pcs.index,
+    columns=[c + "_z" for c in df_const_pcs.columns]
+)
+
+# convert index back into a column
+const_pcs = df_const_pcs_z.reset_index()
+```
+
+**PCA for Census Family Size**
+
+```{python}
+family_size = r.family_size
+family_size = family_size.set_index('AREA_SHORT_CODE')
+
+scaled = StandardScaler().fit_transform(family_size)
+
+# Fit and transform, then wrap back to DataFrame
+family_size_scaled = pd.DataFrame(
+    scaled,
+    columns=family_size.columns,   # preserve column names
+    index=family_size.index        # preserve row labels
+)
+
+pca = PCA()
+
+# fit the components
+pca_family_size = pca.fit_transform(family_size_scaled)
+
+# Explained variance ratio -----------------------------------------------------
+explained_var = pca.explained_variance_ratio_
+num_components = len(explained_var)
+
+# print explained_var and accumulative explained variance
+df_explained_var = pd.DataFrame({
+    "n_pc": np.arange(1, len(explained_var) + 1),
+    "explained_var": explained_var,
+    "cum_var": np.cumsum(explained_var)
+})
+
+print("Table of explained variance \n", df_explained_var.round(3))
+
+# the sum of explained variance should be equal to 1.0 or 100%
+print('Sum of explained variance ratio of all PCs：{}'.format(pca.explained_variance_ratio_.sum()), '\n') 
+
+# Elbow detection using "turning point" (discrete second derivative) -----------
+y = explained_var
+
+# Need at least 3 points to compute a second derivative
+if num_components < 3:
+    # Fallback: choose 1 component if fewer than 3 PCs
+    k = 1
+else:
+    # First differences: dy[i] = y[i+1] - y[i]
+    dy = np.diff(y)                  # length: num_components - 1
+
+    # Second differences: ddy[i] = dy[i+1] - dy[i]
+    ddy = np.diff(dy)                # length: num_components - 2
+
+    # Index of max absolute curvature (turning point)
+    # ddy[i] is curvature at original index i+1 (0-based)
+    turning_idx = np.argmax(np.abs(ddy))  # in range [0, num_components-3]
+
+    # Convert to PC index (1-based for plotting/human interpretation)
+    k = turning_idx + 2  # +1 for 0-based -> original index, +1 more because curvature is at i+1
+
+print(f"Chosen k based on turning-point elbow detection: {k} \n")
+
+# Show the loading table -------------------------------------------------------
+df_PC = pd.DataFrame(pca.components_, columns = family_size_scaled.columns.to_list()) # the list_var_X is used as the column names
+print('Factor Loading Table : \n', df_PC)
+```
+
+The turning elbow detection and explained variance suggests to choose the first two PCs because cumulatively it could explain about 98% of variance across all family size metrics.
+
+However, when compared with the loading table, the first PC has positive loading for 2-person families and negative loading for 3-person and 4-person families, which can be seen as a **2-person VS larger families** spectrum. It also can explain 83% of the variance.
+
+For ease of analysis, only the first PC will be selected and standardised for regression.
+
+```{python}
+selected_PC = 1
+pca = PCA(selected_PC, random_state=0)
+scores = pca.fit_transform(family_size_scaled)
+
+# Put scores in a DF with the SAME index (row_id)
+pc_cols = [f"family_size_PC{i+1}" for i in range(selected_PC)]
+df_family_size_pcs = pd.DataFrame(scores, index=family_size.index, columns=pc_cols)
+
+# Standardise PC scores (so each has mean 0, SD 1)
+scaler_pc = StandardScaler()
+df_family_size_pcs_z = pd.DataFrame(
+    scaler_pc.fit_transform(df_family_size_pcs),
+    index=df_family_size_pcs.index,
+    columns=[c + "_z" for c in df_family_size_pcs.columns]
+)
+
+# convert index back into a column
+family_size_pcs = df_family_size_pcs_z.reset_index()
+```
+
+Now we need to bring the PCA, produced through Python code, back into R and merge it to form the final regressions data object.
+
+```{r message=FALSE, warning=FALSE}
+access_pcs <- py$access_pcs
+housing_pcs <- py$housing_pcs
+const_pcs <- py$const_pcs
+family_size_pcs <- py$family_size_pcs
+
+toronto_regression <- toronto_combined %>%
+  left_join(., access_pcs, by = 'AREA_SHORT_CODE') %>%
+  left_join(., housing_pcs, by = 'AREA_SHORT_CODE') %>%
+  left_join(., const_pcs, by = 'AREA_SHORT_CODE') %>%
+  left_join(., family_size_pcs, by = 'AREA_SHORT_CODE') %>%
+
+  rename(
+    general_access = access_PC1_z,
+    singledet_duplex = housing_PC1_z,
+    semidet_row_vs_single = housing_PC2_z,
+    row_vs_semidet = housing_PC3_z,
+    before_60s = const_PC1_z,
+    x6080s = const_PC2_z,
+    x2p_vs_large = family_size_PC1_z
+    ) %>%
+  
+  filter(eligible_type_count != 0) %>%
+  
+  dplyr::select(AREA_SHORT_CODE, area_name, adu_rate, general_access, singledet_duplex, semidet_row_vs_single, row_vs_semidet, before_60s, x6080s, young_dep, old_dep, domestic_movers, foreign_movers, vis_min_rate, x2p_vs_large, couples_wchildren, single_parent, with_mortgage, mortgage_unaffordable, unsuitability_rate, median_aftertax_income, gini_index)
+```
+
+### Let's Do Regression
+
+```{r message=FALSE, warning=FALSE}
+# Select only numeric columns
+numeric_cols <- toronto_regression %>% 
+  dplyr::select(-AREA_SHORT_CODE, -area_name) %>%
+  st_drop_geometry()
+
+# Convert to long format for faceting
+numeric_long <- numeric_cols %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Plot faceted histograms
+ggplot(numeric_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 6) +
+  theme_minimal() +
+  labs(title = "Histograms of Numerical Variables")
+```
+
+domestic_movers, foreign_movers, vis_min_rate,  single_parent, couples_wchildren, median_aftertax_income, gini_index, mortgage_unaffordable and unsuitability_rate will be log-transformed due to their non-normal distributions. Factors that came from PCAs would not be log-transformed even if the distribution is non-normal so as to facilitate regression interpretation. 
+
+**adu_rate will be log-transformed via log1p(adu_rate) instead of log(adu_rate) because some neighbourhoods have no ADUs --> ADU rates of 0**. In small rates, the difference between log1p(adu_rate) and log(adu_rate) is almost negligible thus can be interpreted in the same way.
+
+Since there are 19 independent variables (out of the original 34), OLS regression will be done by adding variable chunk-by-chunk (accessibility, building stock, demographics, pressures) and getting the highest adjusted R-squared value and all significant variables in each chunk before moving on.
+
+```{r message=FALSE, warning=FALSE}
+access_only <- lm(log1p(adu_rate) ~ 
+                    general_access,
+                  data = toronto_regression)
+
+summary(access_only)
+```
+
+General accessibility alone has a significant relationship with ADU rates
+
+```{r message=FALSE, warning=FALSE}
+access_building <- lm(log1p(adu_rate) ~ 
+                    general_access +
+                    singledet_duplex +
+                    semidet_row_vs_single +
+                    row_vs_semidet + 
+                    before_60s +
+                    x6080s,
+                  data = toronto_regression)
+
+summary(access_building)
+```
+
+```{r message=FALSE, warning=FALSE}
+access_building2 <- lm(log1p(adu_rate) ~ 
+                    general_access +
+                    singledet_duplex +
+                    semidet_row_vs_single +
+                    before_60s,
+                  data = toronto_regression)
+
+summary(access_building2)
+```
+
+After adding all the factors related to housing stock characteristics, the 'single-detached/duplex' dominant and 'before-60s' dominant mixes as well as the 'semi-detached/row VS single-detached' spectrum have significant relationships with ADU rates, on top of general accessibility
+
+```{r}
+ab_demographics <- lm(log1p(adu_rate) ~ 
+                    general_access +
+                    singledet_duplex +
+                    semidet_row_vs_single +
+                    before_60s +
+                    old_dep +
+                    young_dep +
+                    log(domestic_movers) +
+                    log(foreign_movers) +
+                    log(vis_min_rate),
+                  data = toronto_regression)
+
+summary(ab_demographics)
+```
+
+```{r}
+ab_demographics2 <- lm(log1p(adu_rate) ~ 
+                    general_access +
+                    singledet_duplex +
+                    before_60s +
+                    young_dep,
+                  data = toronto_regression)
+
+summary(ab_demographics2)
+```
+
+When adding the factors related to neighbourhood demographics, only the young dependent population rate has a significant relationship with ADU rates, and it only marginally improves the model. The 'semi-detached/row VS single-detached' spectrum becomes insignificant.
+
+```{r}
+abd_pressures <- lm(log1p(adu_rate) ~ 
+                    general_access +
+                    singledet_duplex +
+                    before_60s +
+                    young_dep +
+                    x2p_vs_large +
+                    log(couples_wchildren) +
+                    log(single_parent) +
+                    with_mortgage +
+                    log(mortgage_unaffordable) +
+                    log(unsuitability_rate) +
+                    log(median_aftertax_income) +
+                    log(gini_index),
+                  data = toronto_regression)
+
+summary(abd_pressures)
+
+# Checking for OLS assumptions of residual linearity, residual normality, homoskedasticity, and non-collinearity of variables.
+check_model(abd_pressures,
+            check = c('linearity', 'homogeneity', 'qq', 'vif'))
+```
+
+```{r}
+abd_pressures2 <- lm(log1p(adu_rate) ~ 
+                    general_access +
+                    singledet_duplex +
+                    before_60s +
+                    young_dep +
+                    x2p_vs_large +
+                    log(couples_wchildren) +
+                    log(single_parent) +
+                    log(unsuitability_rate),
+                  data = toronto_regression)
+
+summary(abd_pressures2)
+
+# Checking for OLS assumptions of residual linearity, residual normality, homoskedasticity, and non-collinearity of variables.
+check_model(abd_pressures2,
+            check = c('linearity', 'homogeneity', 'qq', 'vif'))
+```
+
+When adding all factors related to housing pressures at first, log-transformed rates of couples with children, single parents and housing unsuitability have significant relationships. However, when the model is filtered down to kick out the non-significant variables, housing unsuitability also becomes insignificant. Additionally, the 'before-60s' dominant housing stock and log-transformed rate of single parents have very high collinearity and the model is heteroskedastic. More trial-and-errors will be done in order to get the set of predictors with the highest adjusted R-squared score but also satisfy the OLS assumptions.
+
+```{r}
+final_model <- lm(log1p(adu_rate) ~ 
+                    general_access +
+                    singledet_duplex +
+                    before_60s +
+                    young_dep +
+                    log(single_parent),
+                  data = toronto_regression)
+
+summary(final_model)
+
+# Checking for OLS assumptions of residual linearity, residual normality, homoskedasticity, and non-collinearity of variables.
+check_model(final_model,
+            check = c('linearity', 'homogeneity', 'qq', 'vif'))
+
+# Checking for spatial autocorrelation of residuals
+toronto_regression2 <- toronto_regression %>%
+  mutate(residuals = residuals(final_model))
+
+moran_i <- toronto_regression2 %>%
+  pull(residuals) %>%
+  as.vector() %>%
+  moran.test(., nb2listw(poly2nb(toronto_regression2, queen = TRUE), style = 'W'))
+
+moran_i
+
+```
+
+The best possible situation out of the 19 variables is to have a model (final_model) based on the following five predictors - general accessibility, a 'single-detached/duplex' dominant housing mix, 'before-60s' dominant housing mix, younger-dependent population and log-transformed rate of single parents.
+
+This is because this set of predictors achieved the highest adjusted R-squared value of 0.38, with its residuals fairly linear, slight heteroskedastic, predictors are non-collinear and a fairly normal distribution of residuals (although it slightly overpredicts at both ends of the tail).
+
+The major thing that the OLS model is weak in is on spatial non-autocorrelation of residuals - with a Moran's I statistic of 0.30. Lagrange multiplier tests will be carried out to decide if Spatial Lag or Spatial Error modelling should be applied.
+
+```{r message=FALSE, warning=FALSE}
+lm.LMtests(final_model, 
+           nb2listw(poly2nb(toronto_regression, queen = TRUE), style = 'W', zero.policy = TRUE),
+           test = c("LMerr","LMlag","RLMerr","RLMlag","SARMA"))
+```
+
+The RSlag and adjRSlag statistics are much higher with much lower p-values as compared to RSerr and adjRSerr counterparts. This suggests that a **spatial lag modelling** should be pursued.
+
+```{r message=FALSE, warning=FALSE}
+lag_model <- lagsarlm(log1p(adu_rate) ~ 
+                    general_access +
+                    singledet_duplex +
+                    before_60s +
+                    young_dep +
+                    log(single_parent),
+                    data = toronto_regression,
+                    nb2listw(poly2nb(toronto_regression, queen = TRUE), style = 'W', zero.policy = TRUE),
+                    method = 'eigen',
+                    zero.policy = TRUE)
+
+tidy(lag_model)
+
+#then you generate a sparse matrix
+sparse_mat <- trW(as(nb2listw(poly2nb(toronto_regression, queen = TRUE), style = 'W', zero.policy = TRUE), 'CsparseMatrix'),
+                  type = 'mult')
+
+#then you run the impacts function
+imp <- impacts(lag_model, tr = sparse_mat, R = 2000)
+summary(imp, zstats = TRUE, short = TRUE)
+```
+
+Using queen's contiguity rule in our spatial lag modelling produces a rho estimate of 0.67, suggesting that the spillover effect is very strong. Additionally, general non-auto accessibility becomes insignificant.
